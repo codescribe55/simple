@@ -1,0 +1,24 @@
+# Node dependencies
+/node_modules
+
+# Environment variables
+.env
+
+# Firebase private key
+firebase-service-account.json
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+
+node_modules/
+
+
+.env
+firebase-service-account.json
