@@ -6,8 +6,11 @@ require("dotenv").config();
 
 const router = express.Router();
 const SALT_ROUNDS = 10;
-const SESSION_TTL_MINUTES = parseInt(process.env.SESSION_TTL_MINUTES || "1440", 10);
+const SESSION_TTL_MINUTES = 1440; // 1 day
 
+/* -----------------------------------------
+   REGISTER USER
+------------------------------------------ */
 router.post("/register", async (req, res) => {
   try {
     const { phone, mpin, full_name } = req.body;
@@ -22,33 +25,34 @@ router.post("/register", async (req, res) => {
     const mpin_hash = await bcrypt.hash(mpin, SALT_ROUNDS);
 
     const result = await pool.query(
-      `
-      INSERT INTO users (phone, mpin_hash, full_name, created_at, updated_at)
-      VALUES ($1, $2, $3, NOW(), NOW())
-      ON CONFLICT (phone) DO UPDATE 
-      SET mpin_hash = EXCLUDED.mpin_hash,
-          full_name = COALESCE(EXCLUDED.full_name, users.full_name),
-          updated_at = NOW()
-      RETURNING user_id, phone, full_name;
-      `,
-      [phone, mpin_hash, full_name || null]
+      `INSERT INTO users (phone, full_name, mpin_hash, created_at, updated_at)
+       VALUES ($1, $2, $3, NOW(), NOW())
+       ON CONFLICT (phone) DO UPDATE 
+         SET mpin_hash = EXCLUDED.mpin_hash,
+             full_name = COALESCE(EXCLUDED.full_name, users.full_name),
+             updated_at = NOW()
+       RETURNING user_id, phone, full_name;`,
+      [phone, full_name || null, mpin_hash]
     );
 
     res.json({
       success: true,
       message: "User registered successfully",
-      user: result.rows[0],
+      user: result.rows[0]
     });
 
   } catch (err) {
     console.error("❌ Register error:", err);
     res.status(500).json({
       success: false,
-      message: "Server error while registering",
+      message: "Server error during registration",
     });
   }
 });
 
+/* -----------------------------------------
+   LOGIN USER
+------------------------------------------ */
 router.post("/login", async (req, res) => {
   try {
     const { phone, mpin } = req.body;
@@ -56,27 +60,33 @@ router.post("/login", async (req, res) => {
     if (!phone || !mpin) {
       return res.status(400).json({
         success: false,
-        message: "Phone number and mPIN are required",
+        message: "Phone and mPIN required",
       });
     }
 
-    const userResult = await pool.query(
-      "SELECT user_id, phone, full_name, mpin_hash FROM users WHERE phone = $1",
+    const userRes = await pool.query(
+      `SELECT user_id, full_name, phone, mpin_hash 
+       FROM users 
+       WHERE phone = $1`,
       [phone]
     );
 
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "User not found" });
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
     }
 
-    const user = userResult.rows[0];
+    const user = userRes.rows[0];
 
-    const isMatch = await bcrypt.compare(mpin, user.mpin_hash);
-    if (!isMatch) {
-      return res.status(401).json({ success: false, message: "Invalid mPIN" });
+    const valid = await bcrypt.compare(mpin, user.mpin_hash);
+    if (!valid) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid mPIN"
+      });
     }
-
-    const expiresAt = new Date(Date.now() + SESSION_TTL_MINUTES * 60 * 1000);
 
     const token = jwt.sign(
       { user_id: user.user_id, phone: user.phone },
@@ -85,22 +95,18 @@ router.post("/login", async (req, res) => {
     );
 
     await pool.query(
-      `
-      INSERT INTO sessions (user_id, token, expires_at)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (user_id) DO UPDATE 
-      SET token = $2, expires_at = $3;
-      `,
-      [user.user_id, token, expiresAt]
+      `INSERT INTO sessions (user_id, token, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '1 day')
+       ON CONFLICT (user_id) DO UPDATE 
+         SET token = $2, expires_at = NOW() + INTERVAL '1 day'`,
+      [user.user_id, token]
     );
 
     res.json({
       success: true,
       message: "Login successful",
-      user_id: user.user_id,
-      full_name: user.full_name,
-      phone: user.phone,
       token,
+      user
     });
 
   } catch (err) {
@@ -111,47 +117,5 @@ router.post("/login", async (req, res) => {
     });
   }
 });
-
-
-router.get("/validate-session", async (req, res) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader)
-    return res.status(401).json({ success: false, message: "Missing token" });
-
-  const token = authHeader.split(" ")[1];
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    const result = await pool.query(
-      "SELECT expires_at FROM sessions WHERE user_id = $1 AND token = $2",
-      [decoded.user_id, token]
-    );
-
-    if (result.rows.length === 0)
-      return res.status(401).json({ success: false, message: "Invalid session" });
-
-    const expiresAt = new Date(result.rows[0].expires_at);
-
-    if (expiresAt < new Date())
-      return res.status(403).json({ success: false, message: "Session expired" });
-
-    res.json({
-      success: true,
-      message: "Session valid",
-      user_id: decoded.user_id,
-      phone: decoded.phone,
-    });
-
-  } catch (err) {
-    console.error("❌ Validate session error:", err);
-    res.status(403).json({
-      success: false,
-      message: "Invalid or expired token",
-    });
-  }
-});
-
 
 module.exports = router;
