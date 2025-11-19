@@ -1,130 +1,173 @@
 const express = require("express");
 const router = express.Router();
 const pool = require("../db");
-const admin = require("../services/firebaseService");
+const jwt = require("jsonwebtoken");
 
-// 🧘 Add or update chanting record
-router.post("/addChant", async (req, res) => {
+const authMiddleware = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader)
+    return res.status(401).json({ success: false, message: "Missing token" });
+
+  const token = authHeader.split(" ")[1];
+
   try {
-    const { idToken, chant_date, rounds } = req.body;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded; 
+    next();
+  } catch (err) {
+    return res.status(403).json({ success: false, message: "Invalid token" });
+  }
+};
 
-    if (!idToken || rounds == null) {
-      return res.status(400).json({ success: false, message: "Missing required fields" });
+router.post("/add", authMiddleware, async (req, res) => {
+  try {
+    const { rounds } = req.body;
+    const user_id = req.user.user_id;
+
+    if (!rounds || rounds <= 0) {
+      return res.status(400).json({ success: false, message: "Rounds required" });
     }
 
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    const phone_number = decoded.phone_number;
-
-    if (!phone_number) {
-      return res.status(400).json({ success: false, message: "Phone number not found in token" });
-    }
-
-    const chantDate = chant_date ? new Date(chant_date).toISOString().split("T")[0] : new Date().toISOString().split("T")[0];
-
-    const existing = await pool.query(
-      "SELECT rounds FROM chanting_records WHERE phone_number = $1 AND chant_date = $2",
-      [phone_number, chantDate]
+    // insert chant
+    const result = await pool.query(
+      `INSERT INTO chant_entries (user_id, rounds, created_at)
+       VALUES ($1, $2, NOW())
+       RETURNING entry_id, rounds, created_at;`,
+      [user_id, rounds]
     );
 
-    if (existing.rows.length > 0) {
-      const updatedRounds = existing.rows[0].rounds + rounds;
+    const today = new Date().toISOString().split("T")[0];
+
+    const lastEntry = await pool.query(
+      `SELECT DATE(created_at) AS last_date 
+       FROM chant_entries 
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [user_id]
+    );
+
+    let lastDate = null;
+    if (lastEntry.rows.length > 1) {
+      lastDate = lastEntry.rows[1].last_date;
+    }
+
+    let currentStreak = 1;
+    let longestStreak = 1;
+
+    const streakRow = await pool.query(
+      `SELECT current_streak, longest_streak 
+       FROM user_streaks WHERE user_id = $1`,
+      [user_id]
+    );
+
+    if (streakRow.rows.length > 0) {
+      const prevDate = streakRow.rows[0].last_date;
+
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+
+      if (prevDate === yesterday.toISOString().split("T")[0]) {
+        currentStreak = streakRow.rows[0].current_streak + 1;
+      } else {
+        currentStreak = 1;
+      }
+
+      longestStreak = Math.max(currentStreak, streakRow.rows[0].longest_streak);
+
       await pool.query(
-        `UPDATE chanting_records SET rounds = $1, updated_at = NOW() WHERE phone_number = $2 AND chant_date = $3`,
-        [updatedRounds, phone_number, chantDate]
+        `UPDATE user_streaks 
+         SET current_streak = $1, longest_streak = $2, last_date = $3 
+         WHERE user_id = $4`,
+        [currentStreak, longestStreak, today, user_id]
       );
-      return res.json({ success: true, message: "Chant count updated successfully", data: { total_for_day: updatedRounds } });
+
     } else {
       await pool.query(
-        `INSERT INTO chanting_records (phone_number, chant_date, rounds) VALUES ($1, $2, $3)`,
-        [phone_number, chantDate, rounds]
+        `INSERT INTO user_streaks (user_id, current_streak, longest_streak, last_date)
+         VALUES ($1, 1, 1, $2)`,
+        [user_id, today]
       );
-      return res.json({ success: true, message: "Chant record added successfully", data: { total_for_day: rounds } });
     }
-  } catch (error) {
-    console.error("❌ Error in /addChant:", error);
-    res.status(500).json({ success: false, message: "Server error while adding chant record" });
+
+    res.json({
+      success: true,
+      message: "Chant entry added",
+      entry: result.rows[0],
+      streaks: { currentStreak, longestStreak },
+    });
+
+  } catch (err) {
+    console.error("❌ Error in /add:", err);
+    res.status(500).json({ success: false, message: "Server error adding chant" });
   }
 });
 
-// 📊 Get chanting summary (total + per-day)
-router.get("/getChantSummary/:phone_number", async (req, res) => {
+router.get("/summary", authMiddleware, async (req, res) => {
   try {
-    const { phone_number } = req.params;
+    const user_id = req.user.user_id;
 
-    if (!phone_number) {
-      return res.status(400).json({
-        success: false,
-        message: "Phone number required",
-      });
-    }
-
-    const { rows: records } = await pool.query(
-      "SELECT chant_date, rounds FROM chanting_records WHERE phone_number = $1 ORDER BY chant_date DESC",
-      [phone_number]
+    const total = await pool.query(
+      `SELECT COALESCE(SUM(rounds), 0) AS total_rounds 
+       FROM chant_entries WHERE user_id = $1`,
+      [user_id]
     );
 
-    const { rows: total } = await pool.query(
-      "SELECT COALESCE(SUM(rounds), 0) AS total_rounds FROM chanting_records WHERE phone_number = $1",
-      [phone_number]
+    const daily = await pool.query(
+      `SELECT DATE(created_at) AS date, SUM(rounds) AS rounds
+       FROM chant_entries
+       WHERE user_id = $1
+       GROUP BY DATE(created_at)
+       ORDER BY date DESC`,
+      [user_id]
+    );
+
+    const streaks = await pool.query(
+      `SELECT current_streak, longest_streak 
+       FROM user_streaks WHERE user_id = $1`,
+      [user_id]
     );
 
     res.json({
       success: true,
-      message: "Chanting summary fetched successfully",
-      total_rounds: total[0].total_rounds,
-      records,
+      total_rounds: total.rows[0].total_rounds,
+      daily: daily.rows,
+      streaks: streaks.rows[0] || { current_streak: 0, longest_streak: 0 },
     });
-  } catch (error) {
-    console.error("❌ Error in /getChantSummary:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching chanting data",
-    });
+
+  } catch (err) {
+    console.error("❌ Error in /summary:", err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
 router.get("/leaderboard", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      WITH streaks AS (
-        SELECT 
-          phone_number,
-          chant_date,
-          LAG(chant_date) OVER (PARTITION BY phone_number ORDER BY chant_date) AS prev_date
-        FROM chanting_records
-      ),
-      consecutive_days AS (
-        SELECT 
-          phone_number,
-          COUNT(*) AS streak_days
-        FROM streaks
-        WHERE chant_date - COALESCE(prev_date, chant_date - INTERVAL '1 day') = INTERVAL '1 day'
-        GROUP BY phone_number
-      )
+    const result = await pool.query(`
       SELECT 
-        u.username,
-        u.phone_number,
-        COALESCE(SUM(c.rounds), 0) AS total_malas,
+        u.full_name,
+        u.phone,
+        COALESCE(SUM(c.rounds), 0) AS total_rounds,
         COALESCE(SUM(c.rounds) * 108, 0) AS total_beads,
-        COALESCE(cd.streak_days, 0) AS streak_days
+        COALESCE(s.current_streak, 0) AS current_streak,
+        COALESCE(s.longest_streak, 0) AS longest_streak
       FROM users u
-      LEFT JOIN chanting_records c ON u.phone_number = c.phone_number
-      LEFT JOIN consecutive_days cd ON u.phone_number = cd.phone_number
-      GROUP BY u.username, u.phone_number, cd.streak_days
+      LEFT JOIN chant_entries c ON u.user_id = c.user_id
+      LEFT JOIN user_streaks s ON u.user_id = s.user_id
+      GROUP BY u.user_id, u.full_name, u.phone, s.current_streak, s.longest_streak
       ORDER BY total_beads DESC;
     `);
 
     res.json({
       success: true,
-      message: "Leaderboard data fetched successfully",
-      data: rows,
+      message: "Leaderboard fetched",
+      data: result.rows,
     });
-  } catch (error) {
-    console.error("❌ Error in /leaderboard:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching leaderboard data",
-    });
+
+  } catch (err) {
+    console.error("❌ Leaderboard error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
