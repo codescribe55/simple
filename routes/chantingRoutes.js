@@ -23,7 +23,7 @@ const authMiddleware = async (req, res, next) => {
 router.post("/add", authMiddleware, async (req, res) => {
   try {
     const { rounds, chant_date } = req.body;
-    const user_id = req.user.user_id; // ✅ FIXED
+    const user_id = req.user.user_id;
 
     if (!rounds || rounds <= 0) {
       return res.status(400).json({
@@ -32,20 +32,19 @@ router.post("/add", authMiddleware, async (req, res) => {
       });
     }
 
-    // ✅ Use selected date OR today's date
+    // 📌 Use selected date or today's date
     const chantDate = chant_date ? new Date(chant_date) : new Date();
+    const todayStr = chantDate.toISOString().split("T")[0];
 
-    // Insert chanting record
+    // 📌 Add Chant Entry
     const entry = await pool.query(
       `INSERT INTO chant_entries (user_id, rounds, created_at)
        VALUES ($1, $2, $3)
        RETURNING entry_id, rounds, created_at`,
-      [user_id, rounds, chantDate] // ✅ FIXED DATE INSERT
+      [user_id, rounds, chantDate]
     );
 
-    const today = chantDate.toISOString().split("T")[0];
-
-    // Fetch current streak row
+    // 📌 Fetch streak row
     const streakRow = await pool.query(
       `SELECT current_streak, longest_streak, last_date
        FROM user_streaks
@@ -57,51 +56,45 @@ router.post("/add", authMiddleware, async (req, res) => {
     let longestStreak = 1;
 
     if (streakRow.rows.length > 0) {
-      const prevDate = streakRow.rows[0].last_date;
+      const prevDate = streakRow.rows[0].last_date; // This is a STRING in Neon!
+      const prevDateStr = prevDate ? new Date(prevDate).toISOString().split("T")[0] : null;
 
+      // Calculate yesterday
       const yesterday = new Date(chantDate);
       yesterday.setDate(yesterday.getDate() - 1);
-      const yDay = yesterday.toISOString().split("T")[0];
+      const yesterdayStr = yesterday.toISOString().split("T")[0];
 
-      const prevDateStr = prevDate
-        ? prevDate.toISOString().split("T")[0]
-        : null;
-
-      if (prevDateStr === yDay) {
+      // If last entry was yesterday → streak continues
+      if (prevDateStr === yesterdayStr) {
         currentStreak = streakRow.rows[0].current_streak + 1;
       } else {
         currentStreak = 1;
       }
 
-      longestStreak = Math.max(
-        streakRow.rows[0].longest_streak,
-        currentStreak
-      );
+      // Recalculate longest streak
+      longestStreak = Math.max(streakRow.rows[0].longest_streak, currentStreak);
 
       // Update streak record
       await pool.query(
         `UPDATE user_streaks
          SET current_streak = $1, longest_streak = $2, last_date = $3
          WHERE user_id = $4`,
-        [currentStreak, longestStreak, today, user_id]
+        [currentStreak, longestStreak, todayStr, user_id]
       );
     } else {
-      // First ever chant → create streak row
+      // First ever chant
       await pool.query(
         `INSERT INTO user_streaks (user_id, current_streak, longest_streak, last_date)
          VALUES ($1, 1, 1, $2)`,
-        [user_id, today]
+        [user_id, todayStr]
       );
     }
 
-    res.json({
+    return res.json({
       success: true,
       message: "Chant entry added",
       entry: entry.rows[0],
-      streaks: {
-        currentStreak,
-        longestStreak,
-      },
+      streaks: { currentStreak, longestStreak },
     });
 
   } catch (err) {
@@ -112,6 +105,7 @@ router.post("/add", authMiddleware, async (req, res) => {
     });
   }
 });
+
 
 
 router.get("/summary", authMiddleware, async (req, res) => {
