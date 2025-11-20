@@ -22,24 +22,28 @@ const authMiddleware = async (req, res, next) => {
 
 router.post("/add", authMiddleware, async (req, res) => {
   try {
-    const { rounds } = req.body;
-    const user_id = req.user_id;
+    const { rounds, chant_date } = req.body;
+    const user_id = req.user.user_id; // ✅ FIXED
 
     if (!rounds || rounds <= 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Rounds required" });
+      return res.status(400).json({
+        success: false,
+        message: "Rounds required",
+      });
     }
+
+    // ✅ Use selected date OR today's date
+    const chantDate = chant_date ? new Date(chant_date) : new Date();
 
     // Insert chanting record
     const entry = await pool.query(
       `INSERT INTO chant_entries (user_id, rounds, created_at)
-       VALUES ($1, $2, NOW())
+       VALUES ($1, $2, $3)
        RETURNING entry_id, rounds, created_at`,
-      [user_id, rounds]
+      [user_id, rounds, chantDate] // ✅ FIXED DATE INSERT
     );
 
-    const today = new Date().toISOString().split("T")[0];
+    const today = chantDate.toISOString().split("T")[0];
 
     // Fetch current streak row
     const streakRow = await pool.query(
@@ -55,7 +59,7 @@ router.post("/add", authMiddleware, async (req, res) => {
     if (streakRow.rows.length > 0) {
       const prevDate = streakRow.rows[0].last_date;
 
-      const yesterday = new Date();
+      const yesterday = new Date(chantDate);
       yesterday.setDate(yesterday.getDate() - 1);
       const yDay = yesterday.toISOString().split("T")[0];
 
@@ -74,6 +78,7 @@ router.post("/add", authMiddleware, async (req, res) => {
         currentStreak
       );
 
+      // Update streak record
       await pool.query(
         `UPDATE user_streaks
          SET current_streak = $1, longest_streak = $2, last_date = $3
@@ -93,8 +98,12 @@ router.post("/add", authMiddleware, async (req, res) => {
       success: true,
       message: "Chant entry added",
       entry: entry.rows[0],
-      streaks: { currentStreak, longestStreak },
+      streaks: {
+        currentStreak,
+        longestStreak,
+      },
     });
+
   } catch (err) {
     console.error("❌ Error in /add:", err);
     res.status(500).json({
@@ -103,6 +112,7 @@ router.post("/add", authMiddleware, async (req, res) => {
     });
   }
 });
+
 
 router.get("/summary", authMiddleware, async (req, res) => {
   try {
